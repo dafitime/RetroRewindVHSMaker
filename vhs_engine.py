@@ -441,7 +441,6 @@ _DEFAULTS = {
     "glitch"      : False,
     "glitch_level": 0.25,
     "tape_tear"   : False,
-    # new intensity keys
     "scanlines_str"   : 0.72,
     "vignette_str"    : 0.55,
     "bleed_shift"     : 4,
@@ -449,6 +448,13 @@ _DEFAULTS = {
     "hue_drift_amt"   : 3.0,
     "desat_amt"       : 0.12,
     "tear_prob"       : 0.006,
+    # authenticity effects
+    "interlace"    : True,
+    "head_switch"  : True,
+    "dropout"      : False,
+    "edge_ringing" : False,
+    "chroma_noise" : False,  # opt-in — can shift color cast on achromatic pixels
+    "wobble"       : False,
 }
 
 
@@ -572,6 +578,74 @@ def apply_vhs(frame: np.ndarray, maps: VHSMaps, settings: dict,
         jy      = random.randint(0, h - 1)
         out[jy] = np.clip(out[jy] * random.uniform(1.4, 2.2), 0, 255)
 
+    # ── Interlacing ─────────────────────────────────────────
+    # VHS was interlaced — odd and even lines came from different
+    # fields captured at slightly different times. On moving subjects
+    # this creates a characteristic "comb" effect on horizontal edges.
+    if s["interlace"]:
+        # Horizontal field mis-alignment — use explicit copies to avoid aliasing
+        if w > 2:
+            even = out[::2].copy()
+            odd  = out[1::2].copy()
+            out[::2,  1:,  :] = even[:, :-1, :] * 0.85 + even[:, 1:, :] * 0.15
+            out[1::2, :-1, :] = odd[:,  1:,  :] * 0.85 + odd[:,  :-1, :] * 0.15
+
+    # ── Head switching noise ────────────────────────────────
+    # VHS heads switch at the bottom of every frame, causing a band
+    # of horizontal noise at the very bottom — unmistakable VHS artifact.
+    if s["head_switch"]:
+        band_h = max(2, int(h * 0.03))   # bottom 3% of frame
+        y0     = h - band_h
+        noise  = np.random.normal(0, 40, (band_h, w, 3)).astype(np.float32)
+        # Shift the band horizontally too
+        shift  = random.randint(-8, 8)
+        out[y0:, :, :] = np.roll(out[y0:, :, :], shift, axis=1)
+        out[y0:, :, :] = np.clip(out[y0:, :, :] + noise, 0, 255)
+
+    # ── Tape dropout ────────────────────────────────────────
+    # Random white horizontal streaks — damaged tape oxide particles.
+    if s["dropout"] and random.random() < 0.08:
+        for _ in range(random.randint(1, 3)):
+            dy  = random.randint(0, h - 1)
+            dw  = random.randint(w // 8, w // 2)
+            dx  = random.randint(0, w - dw)
+            out[dy, dx:dx+dw, :] = 255.0
+
+    # ── Edge ringing ────────────────────────────────────────
+    # VHS had an aperture correction circuit that over-sharpened edges,
+    # creating bright/dark halos on high-contrast boundaries.
+    if s["edge_ringing"]:
+        u8     = np.clip(out, 0, 255).astype(np.uint8)
+        kernel = np.array([[0, -0.5, 0],
+                           [-0.5, 3, -0.5],
+                           [0, -0.5, 0]], np.float32)
+        sharp  = cv2.filter2D(u8, -1, kernel).astype(np.float32)
+        out    = out * 0.6 + sharp * 0.4
+
+    # ── Chroma noise ────────────────────────────────────────
+    # VHS chroma bandwidth was ~0.4 MHz vs ~3 MHz for luma.
+    # Only add noise to pixels that already have meaningful saturation —
+    # achromatic pixels (sat < 20) have undefined hue, don't touch them.
+    if s["chroma_noise"]:
+        u8   = np.clip(out, 0, 255).astype(np.uint8)
+        hsv  = cv2.cvtColor(u8, cv2.COLOR_BGR2HSV).astype(np.float32)
+        mask = hsv[:, :, 1] > 20   # only chromatic pixels
+        hue_noise = np.random.normal(0, 3,  (h, w)).astype(np.float32)
+        sat_noise = np.random.normal(0, 8,  (h, w)).astype(np.float32)
+        hsv[:, :, 0] = np.where(mask, (hsv[:, :, 0] + hue_noise) % 180, hsv[:, :, 0])
+        hsv[:, :, 1] = np.where(mask, np.clip(hsv[:, :, 1] + sat_noise, 0, 255), hsv[:, :, 1])
+        out = cv2.cvtColor(
+            np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR
+        ).astype(np.float32)
+
+    # ── Speed wobble ─────────────────────────────────────────
+    # Tape tension variation causes very slight vertical frame shift.
+    # Implemented as a 1–2px vertical roll of a random strip.
+    if s["wobble"] and random.random() < 0.3:
+        wobble_amt = random.choice([-1, 1])
+        split      = random.randint(h // 3, 2 * h // 3)
+        out[:split] = np.roll(out[:split], wobble_amt, axis=0)
+
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -604,8 +678,8 @@ def _apply_vhs_gpu(frame: np.ndarray, maps: VHSMaps, s: dict,
     # ── Flicker — GPU scalar multiply ───────────────────────
     if s["flicker"]:
         factor = 1.0 + random.uniform(-s["flicker_range"], s["flicker_range"])
-        u_frame = cv2.multiply(u_frame, factor)
-
+        u_frame = cv2.multiply(u_frame, (factor, factor, factor, 1.0))
+        
     # ── Chroma bleed — CPU (indexed slice, no UMat equivalent) ─
     if s["chroma_bleed"]:
         shift = int(s["bleed_shift"])

@@ -26,20 +26,50 @@ from vhs_engine import CropAnalyser, CropPlan, VHSMaps, apply_vhs, detect_gpu
 # ──────────────────────────────────────────────────────────────
 #  THEME
 # ──────────────────────────────────────────────────────────────
-BG       = "#0e0e0e"
-BG2      = "#141414"
-BG3      = "#1e1e1e"
-BG4      = "#282828"
-BORDER   = "#2a2a2a"
-ACCENT   = "#cc0033"
-ACCENT2  = "#ff6b35"
-TEXT     = "#e8ddd0"
-TEXT_DIM = "#5a534a"
-LED      = "#39ff14"
+BG       = "#0a0a0f"   # deep dark navy
+BG2      = "#111118"   # panel bg
+BG3      = "#16161f"   # input / section bg
+BG4      = "#1e1e2e"   # border fill
+BORDER   = "#2a2a3e"   # border lines
+ACCENT   = "#cc0033"   # red action
+ACCENT2  = "#e8c840"   # gold highlight (from CSS --acc)
+TEXT     = "#f0f0ff"   # bright white-blue text
+TEXT_DIM = "#7070a0"   # muted (from CSS --mut2 lightened)
+LED      = "#40e880"   # green LED (from CSS --grn)
 FT       = "Courier New"
 
 def _font(size=10, bold=False):
     return (FT, size, "bold") if bold else (FT, size)
+
+
+def _find_ffmpeg():
+    """
+    Locate the ffmpeg binary.
+    Priority:
+      1. Bundled inside PyInstaller _MEIPASS  (always works when distributed)
+      2. System PATH  (works when running from source)
+    Returns the full path string, or None if not found.
+    """
+    exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+
+    # 1. PyInstaller bundle
+    if hasattr(sys, "_MEIPASS"):
+        bundled = os.path.join(sys._MEIPASS, exe)
+        if os.path.isfile(bundled):
+            return bundled
+
+    # 2. Beside the running script/exe (user dropped ffmpeg next to the app)
+    here = os.path.dirname(os.path.abspath(sys.argv[0]))
+    beside = os.path.join(here, exe)
+    if os.path.isfile(beside):
+        return beside
+
+    # 3. System PATH
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    return None
 
 
 def _set_icon(window):
@@ -415,17 +445,48 @@ class CombinedPreviewCanvas(tk.Canvas):
     W = 380
     H = 220
 
+    PREVIEW_FRAMES = 30   # frames extracted from video for preview loop
+
     def __init__(self, parent, **kw):
         super().__init__(parent, width=self.W, height=self.H,
                          bg="#000000", highlightthickness=1,
                          highlightbackground=BORDER, **kw)
-        self._settings  = {}
-        self._after_id  = None
-        self._photo     = None
-        self._frame     = 0
-        self._maps      = None   # VHSMaps built lazily
-        self._base      = self._build_colorbars()
+        self._settings    = {}
+        self._after_id    = None
+        self._photo       = None
+        self._frame       = 0
+        self._maps        = None
+        self._video_frames = []    # list of BGR numpy arrays from loaded video
+        self._base        = self._build_colorbars()
         self._start()
+
+    def load_video(self, path: str):
+        """Extract evenly-spaced preview frames from the video file."""
+        try:
+            cap   = cv2.VideoCapture(path)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total < 1:
+                cap.release()
+                return
+            step   = max(1, total // self.PREVIEW_FRAMES)
+            frames = []
+            for i in range(0, total, step):
+                if len(frames) >= self.PREVIEW_FRAMES:
+                    break
+                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                # Resize to canvas size
+                resized = cv2.resize(frame, (self.W, self.H),
+                                     interpolation=cv2.INTER_LINEAR)
+                frames.append(resized)
+            cap.release()
+            if frames:
+                self._video_frames = frames
+                self._frame = 0
+        except Exception:
+            pass
 
     def _build_colorbars(self):
         """SMPTE color bar test card — ideal for seeing all VHS effects."""
@@ -464,24 +525,32 @@ class CombinedPreviewCanvas(tk.Canvas):
     def _tick(self):
         try:
             from vhs_engine import apply_vhs
-            maps  = self._get_maps()
-            frame = self._base.copy()
+            maps = self._get_maps()
+
+            # Use video frames when loaded, fall back to color bars
+            if self._video_frames:
+                idx   = self._frame % len(self._video_frames)
+                frame = self._video_frames[idx].copy()
+                is_video = True
+            else:
+                frame    = self._base.copy()
+                is_video = False
 
             if self._settings:
                 out    = apply_vhs(frame, maps, self._settings)
                 out_u8 = np.clip(out, 0, 255).astype(np.uint8)
-                # REC indicator if enabled
                 if self._settings.get("rec_overlay", False):
                     cv2.circle(out_u8, (12, 12), 6, (0, 0, 204), -1)
                     cv2.putText(out_u8, "REC", (22, 17),
                                 cv2.FONT_HERSHEY_PLAIN, 0.9, (0, 0, 204), 1)
-                cv2.putText(out_u8, "ALL EFFECTS LIVE",
-                            (6, self.H - 6), cv2.FONT_HERSHEY_PLAIN, 0.75,
-                            (204, 0, 51), 1)
+                label = "LIVE PREVIEW" if is_video else "COLOR BARS — LOAD VIDEO FOR PREVIEW"
+                cv2.putText(out_u8, label,
+                            (4, self.H - 5), cv2.FONT_HERSHEY_PLAIN, 0.7,
+                            (160, 160, 160), 1)
             else:
                 out_u8 = frame.copy()
-                cv2.putText(out_u8, "AWAITING SETTINGS",
-                            (6, self.H - 6), cv2.FONT_HERSHEY_PLAIN, 0.75,
+                cv2.putText(out_u8, "LOAD VIDEO — ADJUST SLIDERS TO SEE LIVE PREVIEW",
+                            (4, self.H - 5), cv2.FONT_HERSHEY_PLAIN, 0.65,
                             (80, 80, 80), 1)
 
             rgb  = cv2.cvtColor(out_u8, cv2.COLOR_BGR2RGB)
@@ -492,7 +561,7 @@ class CombinedPreviewCanvas(tk.Canvas):
         except Exception as e:
             self.delete("all")
             self.create_text(self.W // 2, self.H // 2,
-                             text=f"Error: {str(e)[:80]}",
+                             text=f"Preview error: {str(e)[:60]}",
                              fill="#cc0033", font=("Courier New", 7),
                              justify="center")
 
@@ -573,8 +642,8 @@ class ToggleRow(tk.Frame):
         self.var = tk.BooleanVar(value=default)
         self._box = tk.Checkbutton(
             self, variable=self.var,
-            bg=BG2, activebackground=BG2, selectcolor=BG3,
-            fg=LED, activeforeground=LED,
+            bg=BG2, activebackground=BG2, selectcolor=BG4,
+            fg=ACCENT2, activeforeground=ACCENT2,
             relief="flat", borderwidth=0, cursor="hand2",
         )
         self._box.pack(side="left", padx=(8, 4))
@@ -617,7 +686,7 @@ class SliderRow(tk.Frame):
         self._tip_win     = None   # tooltip Toplevel
 
         # Label
-        lbl = tk.Label(self, text=label, font=_font(9), fg=TEXT_DIM, bg=BG2,
+        lbl = tk.Label(self, text=label, font=_font(9), fg=TEXT, bg=BG2,
                        width=18, anchor="w")
         lbl.pack(side="left", padx=(28, 4))
         self._lbl = lbl   # keep ref so set_enabled can dim it
@@ -826,7 +895,7 @@ class RadioGroup(tk.Frame):
         for text, value, hover_key in options:
             rb = tk.Radiobutton(
                 self, text=text, variable=self.var, value=value,
-                bg=BG2, fg=TEXT, selectcolor=BG3,
+                bg=BG2, fg=TEXT, selectcolor=BG4,
                 activebackground=BG2, activeforeground=LED,
                 font=_font(9), cursor="hand2",
             )
@@ -915,7 +984,7 @@ def run_conversion(input_path, output_path, settings,
 
         cap.release()
         cap  = cv2.VideoCapture(input_path)
-        maps = VHSMaps(max(out_w, out_h))
+        maps = VHSMaps(max(out_w, out_h), w=out_w, h=out_h)
 
         use_gpu = settings.get("use_gpu", False)
 
@@ -932,51 +1001,26 @@ def run_conversion(input_path, output_path, settings,
                 1.0 - settings.get("vignette_str", 0.55) * (1.0 - maps.vignette)
             ).astype(np.float32)
 
-        # ── FFmpeg pipe — write raw BGR directly, skip temp file ──
-        # FFmpeg reads rawvideo from stdin and encodes to output in one pass.
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-s", f"{out_w}x{out_h}",
-            "-pix_fmt", "bgr24",
-            "-r", str(fps),
-            "-i", "pipe:0",          # video from stdin
-            "-i", input_path,        # audio from source
-            "-map", "0:v:0",
-            "-map", "1:a?",
-            "-c:v", "libx264",
-            "-preset", "fast",       # fast = ~2× faster than slow, tiny quality loss
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest",
-            output_path,
-        ]
+        # ── Write to temp file, then mux audio with FFmpeg ──────
+        # cv2.VideoWriter always handles BGR correctly.
+        # Pipe approaches have color ordering issues on some Windows FFmpeg builds.
+        _ffmpeg = _find_ffmpeg()
+        if not _ffmpeg:
+            done_cb(False,
+                    "FFmpeg not found.\n\n"
+                    "If you downloaded the app from GitHub, make sure you downloaded\n"
+                    "the full release zip (not just the .exe) — FFmpeg is included.\n\n"
+                    "Or install FFmpeg from https://ffmpeg.org/download.html")
+            cap.release()
+            return
 
-        # Hide the FFmpeg console window on Windows
-        _popen_kwargs = dict(
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        if sys.platform == "win32":
-            _si = subprocess.STARTUPINFO()
-            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            _si.wShowWindow = subprocess.SW_HIDE
-            _popen_kwargs["startupinfo"] = _si
-            _popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, **_popen_kwargs)
-
-        # Drain FFmpeg stderr in a background thread so its buffer never
-        # fills and deadlocks the pipe while we're writing frames to stdin.
-        ffmpeg_stderr_lines = []
-        def _drain_stderr():
-            for line in ffmpeg_proc.stderr:
-                ffmpeg_stderr_lines.append(line.decode(errors="replace").rstrip())
-        _stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-        _stderr_thread.start()
+        tmp_dir  = tempfile.mkdtemp()
+        # Write PNG-encoded frames to a binary stream.
+        # PNG is lossless, OpenCV writes correct RGB internally,
+        # and FFmpeg reads image2pipe+png with zero color ambiguity.
+        # This is the only approach that works identically on all platforms.
+        png_path = os.path.join(tmp_dir, "frames.png_stream")
+        png_file = open(png_path, "wb")
 
         # ── Process frames with thread pool ──────────────────
         # Decode → crop/resize on main thread (OpenCV not thread-safe for cap.read)
@@ -985,9 +1029,35 @@ def run_conversion(input_path, output_path, settings,
 
         _rec = settings.get("rec_overlay", False)
 
+        # VHS tape quality — scale factors that simulate tape resolution
+        _quality_scales = {
+            "full":   1.0,
+            "hifi":   0.75,
+            "vhs":    0.50,
+            "worn":   0.33,
+            "damage": 0.20,
+        }
+        _quality = settings.get("vhs_quality", "vhs")
+        _scale   = _quality_scales.get(_quality, 0.50)
+
         def process_frame(frame_data):
-            """Run VHS effects + optional REC overlay on a decoded frame."""
-            out_frame = apply_vhs(frame_data, maps, settings, use_gpu=use_gpu)
+            """Downscale → VHS effects → upscale → optional REC overlay."""
+            h0, w0 = frame_data.shape[:2]
+
+            # Downscale to simulate tape resolution (nearest for blocky look)
+            if _scale < 1.0:
+                lo_w = max(4, int(w0 * _scale))
+                lo_h = max(4, int(h0 * _scale))
+                lo   = cv2.resize(frame_data, (lo_w, lo_h),
+                                  interpolation=cv2.INTER_LINEAR)
+                # Build maps matching the ACTUAL lo frame dimensions, not a square
+                lo_maps = VHSMaps(max(lo_w, lo_h), w=lo_w, h=lo_h)
+                vhs_lo  = apply_vhs(lo, lo_maps, settings, use_gpu=use_gpu)
+                # Scale back up with nearest-neighbor (preserves blocky pixel look)
+                out_frame = cv2.resize(vhs_lo, (w0, h0),
+                                       interpolation=cv2.INTER_NEAREST)
+            else:
+                out_frame = apply_vhs(frame_data, maps, settings, use_gpu=use_gpu)
             if _rec:
                 import time as _t
                 ts = _t.strftime("%H:%M:%S")
@@ -1008,13 +1078,21 @@ def run_conversion(input_path, output_path, settings,
                 futures.put(fut)
 
             def flush_one():
-                """Wait for the oldest submitted frame and pipe it to FFmpeg."""
+                """Wait for oldest frame result and write to temp file."""
                 if futures.empty():
                     return
                 fut = futures.get()
                 try:
                     result_frame = fut.result()
-                    ffmpeg_proc.stdin.write(result_frame.tobytes())
+                    # Use Pillow for PNG encoding — PIL.Image.fromarray takes
+                    # explicit RGB array, no BGR/RGB ambiguity on any platform.
+                    import io as _io
+                    from PIL import Image as _PILImage
+                    rgb = cv2.cvtColor(result_frame, cv2.COLOR_BGR2RGB)
+                    pil_img = _PILImage.fromarray(rgb)
+                    buf = _io.BytesIO()
+                    pil_img.save(buf, format='PNG')
+                    png_file.write(buf.getvalue())
                 except Exception as e:
                     errors.append(str(e))
 
@@ -1022,12 +1100,12 @@ def run_conversion(input_path, output_path, settings,
                 if stop_event and stop_event.is_set():
                     # Drain remaining futures cleanly
                     while not futures.empty():
-                        futures.get().cancel()
-                    try:
-                        ffmpeg_proc.stdin.close()
-                        ffmpeg_proc.wait(timeout=3)
-                    except Exception:
-                        ffmpeg_proc.kill()
+                        try: futures.get().cancel()
+                        except: pass
+                    cap.release()
+                    try: png_file.close()
+                    except: pass
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
                     if os.path.exists(output_path):
                         try: os.remove(output_path)
                         except: pass
@@ -1069,21 +1147,56 @@ def run_conversion(input_path, output_path, settings,
                 flush_one()
 
         cap.release()
+        png_file.close()
+        status_cb("Encoding…")
 
-        try:
-            ffmpeg_proc.stdin.close()
-        except Exception:
-            pass
+        _popen_kwargs = dict(
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if sys.platform == "win32":
+            _si = subprocess.STARTUPINFO()
+            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            _si.wShowWindow = subprocess.SW_HIDE
+            _popen_kwargs["startupinfo"] = _si
+            _popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        ffmpeg_proc.wait(timeout=120)
-        _stderr_thread.join(timeout=5)
-        rc = ffmpeg_proc.returncode
+        # If output already exists, back it up first
+        if os.path.exists(output_path):
+            backup = output_path.replace(".mp4", "_backup.mp4")
+            try:
+                if os.path.exists(backup):
+                    os.remove(backup)
+                os.rename(output_path, backup)
+                status_cb(f"Backed up existing file → {os.path.basename(backup)}")
+            except Exception:
+                pass
+
+        # FFmpeg reads PNG stream — image2pipe+png is color-unambiguous on all platforms
+        result = subprocess.run([
+            _ffmpeg, "-y",
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "-r", str(fps),
+            "-i", png_path,
+            "-i", input_path,
+            "-map", "0:v:0",
+            "-map", "1:a?",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ], **_popen_kwargs)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
         if errors:
             done_cb(False, f"Frame processing error: {errors[0]}")
-        elif rc != 0:
-            err_text = "\n".join(ffmpeg_stderr_lines[-20:])
-            done_cb(False, f"FFmpeg error (code {rc}):\n{err_text[-600:]}")
+        elif result.returncode != 0:
+            err = result.stderr.decode(errors="replace")[-600:]
+            done_cb(False, f"FFmpeg error:\n{err}")
         else:
             done_cb(True, output_path)
 
@@ -1110,8 +1223,16 @@ class RetroRewindApp(tk.Tk):
 
         _set_icon(self)
 
-        self._input_path  = tk.StringVar()
-        self._output_path = tk.StringVar()
+        self._input_path   = tk.StringVar()
+        self._output_path  = tk.StringVar()
+        self._game_folder  = tk.StringVar()
+        self._rr_category  = tk.StringVar(value="Action")
+        self._auto_name    = tk.BooleanVar(value=True)
+        self._game_folder.trace_add("write", self._update_output_path)
+        self._rr_category.trace_add("write", self._update_output_path)
+        self._rr_category.trace_add("write", self._refresh_combined)
+        self._auto_name.trace_add("write", self._update_output_path)
+        self._input_path.trace_add("write", self._update_output_path)
         self._progress    = tk.DoubleVar(value=0.0)
         self._status_text = tk.StringVar(value="Ready.")
         self._running     = False
@@ -1177,7 +1298,7 @@ class RetroRewindApp(tk.Tk):
 
         tk.Frame(self, bg=ACCENT, height=3).pack(fill="x", side="bottom")
         tk.Label(self,
-                 text="RETRO REWIND VIDEO STORE  ·  VHS CONVERTER  ·  v1.0",
+                 text="RETRO REWIND VIDEO STORE  ·  VHS CONVERTER  ·  v1.2",
                  font=_font(8), fg=TEXT_DIM, bg=BG).pack(side="bottom", pady=2)
 
         # Build the scrollable content
@@ -1253,7 +1374,7 @@ class RetroRewindApp(tk.Tk):
         """Called when a slider moves — show effect at that exact strength."""
         self._preview.show_strength(key, strength)
         self._preview_lbl.config(text=f"{key.replace('_',' ').upper()}  —  {int(strength*100)}%  ")
-        self._notify_combined()
+        self._refresh_combined()
 
     def _notify_combined(self):
         """Push current settings to the combined preview canvas."""
@@ -1272,14 +1393,105 @@ class RetroRewindApp(tk.Tk):
             tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=18, pady=6)
 
         def section(text):
-            tk.Label(p, text=text, font=_font(8, bold=True),
-                     fg=ACCENT2, bg=BG).pack(anchor="w", padx=18, pady=(0, 2))
+            fr = tk.Frame(p, bg=BG)
+            fr.pack(fill="x", padx=18, pady=(10, 2))
+            tk.Frame(fr, bg=ACCENT2, width=3, height=13).pack(side="left", padx=(0, 6))
+            tk.Label(fr, text=text, font=_font(8, bold=True),
+                     fg=ACCENT2, bg=BG).pack(side="left")
 
         # ── INPUT / OUTPUT ──
         section("INPUT FILE")
         self._file_row(p, self._input_path, "Browse…", self._browse_input, primary=True)
-        section("OUTPUT FILE")
-        self._file_row(p, self._output_path, "Save As…", self._browse_output, primary=False)
+        section("OUTPUT DESTINATION")
+        dest_box = tk.Frame(p, bg=BG2, highlightthickness=1, highlightbackground=BORDER)
+        dest_box.pack(fill="x", padx=18, pady=(0, 6))
+
+        # Game folder row
+        gf_row = tk.Frame(dest_box, bg=BG2)
+        gf_row.pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(gf_row, text="Game folder", font=_font(8, bold=True),
+                 fg=ACCENT2, bg=BG2, width=12, anchor="w").pack(side="left")
+        tk.Entry(gf_row, textvariable=self._game_folder, font=_font(9),
+                 fg=TEXT, bg=BG3, insertbackground=ACCENT,
+                 relief="flat", highlightthickness=1,
+                 highlightcolor=ACCENT, highlightbackground=BORDER).pack(
+                     side="left", fill="x", expand=True, ipady=4, padx=(4, 4))
+        tk.Button(gf_row, text="Auto-detect", command=self._detect_game_folder,
+                  font=_font(8), fg=TEXT_DIM, bg=BG3,
+                  activebackground=BG2, relief="flat", cursor="hand2", padx=8
+                  ).pack(side="right", padx=(0, 4))
+        tk.Button(gf_row, text="Browse", command=self._browse_game_folder,
+                  font=_font(8), fg=TEXT_DIM, bg=BG3,
+                  activebackground=BG2, relief="flat", cursor="hand2", padx=8
+                  ).pack(side="right")
+
+        # Genre buttons
+        tk.Label(dest_box, text="  GENRE  (saves to VHS\\Genre\\RR_Channel_Genre.mp4)",
+                 font=_font(8, bold=True), fg=ACCENT2, bg=BG2).pack(
+                     anchor="w", padx=8, pady=(4, 2))
+
+        # Starter genres (unlocked from start) vs locked
+        STARTER_GENRES = {"Public", "Scifi", "Police"}
+        ALL_GENRES = ["Action","Adult","Drama","Fantasy","Horror",
+                      "Kid","Police","Public","Romance","Scifi"]
+
+        self._genre_btns = {}
+        genre_frame = tk.Frame(dest_box, bg=BG2)
+        genre_frame.pack(fill="x", padx=8, pady=(0, 4))
+
+        # Two rows of genre buttons
+        row_a = tk.Frame(genre_frame, bg=BG2)
+        row_a.pack(fill="x", pady=1)
+        row_b = tk.Frame(genre_frame, bg=BG2)
+        row_b.pack(fill="x", pady=1)
+
+        for i, genre in enumerate(ALL_GENRES):
+            parent_row = row_a if i < 5 else row_b
+            is_starter = genre in STARTER_GENRES
+            # Starters get a green tint, others get dark background
+            idle_bg = "#0a2a0a" if is_starter else BG3
+            idle_fg = LED if is_starter else TEXT
+            tip = " ★ Starter" if is_starter else ""
+            btn = tk.Button(
+                parent_row,
+                text=genre + tip,
+                command=lambda g=genre: self._select_genre(g),
+                font=_font(8),
+                fg=idle_fg, bg=idle_bg,
+                activebackground=ACCENT2, activeforeground=BG,
+                relief="flat", cursor="hand2",
+                padx=8, pady=5,
+            )
+            btn.pack(side="left", padx=2)
+            self._genre_btns[genre] = btn
+
+        # Auto-name checkbox
+        an_row = tk.Frame(dest_box, bg=BG2)
+        an_row.pack(fill="x", padx=8, pady=(2, 2))
+        tk.Checkbutton(an_row, text="Auto-name output  (RR_Channel_Genre.mp4 in game folder)",
+                       variable=self._auto_name,
+                       bg=BG2, activebackground=BG2, selectcolor=BG4,
+                       fg=ACCENT2, activeforeground=ACCENT2,
+                       relief="flat", font=_font(9), cursor="hand2"
+                       ).pack(side="left")
+
+        # Select the first starter genre by default
+        self._rr_category.set("Public")
+        self.after(100, lambda: self._select_genre("Public"))
+
+        # Output path display
+        op_row = tk.Frame(dest_box, bg=BG2)
+        op_row.pack(fill="x", padx=8, pady=(2, 6))
+        tk.Label(op_row, text="Output file", font=_font(8, bold=True),
+                 fg=ACCENT2, bg=BG2, width=12, anchor="w").pack(side="left")
+        tk.Entry(op_row, textvariable=self._output_path, font=_font(9),
+                 fg=TEXT, bg=BG3, insertbackground=ACCENT, relief="flat",
+                 highlightthickness=1, highlightcolor=ACCENT, highlightbackground=BORDER
+                 ).pack(side="left", fill="x", expand=True, ipady=4, padx=(4, 4))
+        tk.Button(op_row, text="Save As…", command=self._browse_output,
+                  font=_font(8), fg=TEXT_DIM, bg=BG3,
+                  activebackground=BG2, relief="flat", cursor="hand2", padx=8
+                  ).pack(side="right")
 
         sep()
 
@@ -1373,6 +1585,33 @@ class RetroRewindApp(tk.Tk):
         s_tear      = sld("Tape tear prob",      "_tear_prob_var",      0.006, to=0.025,
                           hover_key="tape_tear", fmt=lambda v: f"{v*100:.1f}%")
 
+        # Additional VHS authenticity effects
+        tk.Frame(fx_box, bg=BORDER, height=1).pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(fx_box, text="  AUTHENTICITY", font=_font(8, bold=True),
+                 fg=ACCENT2, bg=BG2).pack(anchor="w", padx=8, pady=(0, 2))
+
+        auth_frame = tk.Frame(fx_box, bg=BG2)
+        auth_frame.pack(fill="x", padx=4)
+        al = tk.Frame(auth_frame, bg=BG2)
+        ar2 = tk.Frame(auth_frame, bg=BG2)
+        al.pack(side="left", fill="both", expand=True)
+        ar2.pack(side="left", fill="both", expand=True)
+
+        def auth_tog(parent, key, label, default=False):
+            row = ToggleRow(parent, label, default=default,
+                            hover_key=None, hover_cb=None)
+            row.pack(fill="x", pady=1)
+            self._fx[key] = row.var
+            row.var.trace_add("write", self._refresh_combined)
+            return row
+
+        auth_tog(al,  "interlace",    "Interlacing",    default=False)
+        auth_tog(al,  "head_switch",  "Head Switching", default=False)
+        auth_tog(al,  "dropout",      "Tape Dropout",   default=False)
+        auth_tog(ar2, "edge_ringing", "Edge Ringing",   default=False)
+        auth_tog(ar2, "chroma_noise", "Chroma Noise",   default=False)
+        auth_tog(ar2, "wobble",       "Speed Wobble",   default=False)
+
         # REC overlay toggle
         tk.Frame(fx_box, bg=BORDER, height=1).pack(fill="x", padx=8, pady=(6, 2))
         t_rec = ToggleRow(fx_box, "REC Overlay  (●  timecode burn-in)", default=False,
@@ -1380,6 +1619,42 @@ class RetroRewindApp(tk.Tk):
         t_rec.pack(fill="x")
         self._fx["rec_overlay"] = t_rec.var
         t_rec.var.trace_add("write", self._refresh_combined)
+
+        # VHS tape quality (internal resolution before effects)
+        tk.Frame(fx_box, bg=BORDER, height=1).pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(fx_box, text="  VHS TAPE QUALITY", font=_font(8, bold=True),
+                 fg=ACCENT2, bg=BG2).pack(anchor="w", padx=8, pady=(0, 2))
+        tk.Label(fx_box, text="  Downscale before effects for authentic lo-fi VHS resolution",
+                 font=_font(7), fg=TEXT_DIM, bg=BG2).pack(anchor="w", padx=8, pady=(0, 4))
+
+        quality_row = tk.Frame(fx_box, bg=BG2)
+        quality_row.pack(fill="x", padx=8, pady=(0, 4))
+
+        self._vhs_quality = tk.StringVar(value="vhs")
+        quality_presets = [
+            ("Full",        "full",   "No downscale — sharp"),
+            ("Hi-Fi VHS",   "hifi",   "75% — VHS Hi-Fi"),
+            ("VHS",         "vhs",    "50% — Standard VHS"),
+            ("Worn Tape",   "worn",   "33% — Degraded"),
+            ("Damaged",     "damage", "20% — Barely watchable"),
+        ]
+        self._quality_btns = {}
+        for label, key, tip in quality_presets:
+            is_default = (key == "vhs")
+            btn = tk.Button(
+                quality_row, text=label,
+                command=lambda k=key: self._set_vhs_quality(k),
+                font=_font(8, bold=is_default),
+                fg=BG if is_default else TEXT_DIM,
+                bg=ACCENT if is_default else BG3,
+                activebackground=ACCENT2, activeforeground=BG,
+                relief="flat", cursor="hand2",
+                padx=6, pady=4,
+            )
+            btn.pack(side="left", padx=2)
+            btn.bind("<Enter>", lambda e, t=tip: self._status_text.set(t))
+            btn.bind("<Leave>", lambda e: self._status_text.set(""))
+            self._quality_btns[key] = btn
 
         # Output size slider
         tk.Frame(fx_box, bg=BORDER, height=1).pack(fill="x", padx=8, pady=(6, 2))
@@ -1390,20 +1665,21 @@ class RetroRewindApp(tk.Tk):
         size_row.pack(fill="x", padx=8, pady=(0, 4))
 
         self._out_size = tk.IntVar(value=512)
-        size_presets = [256, 320, 384, 512, 640, 768, 1024]
+        size_presets = [256, 320, 384, 480, 512, 640, 768, 1024]
 
         size_btn_row = tk.Frame(size_row, bg=BG2)
         size_btn_row.pack(fill="x")
 
         self._size_btns = {}
         for sz in size_presets:
-            is_default = (sz == 512)
+            is_default = (sz == self._out_size.get())
+            is_game_std = (sz == 512)
             btn = tk.Button(
-                size_btn_row, text=str(sz),
+                size_btn_row, text=(str(sz) + " ★") if is_game_std else str(sz),
                 command=lambda s=sz: self._set_output_size(s),
                 font=_font(8, bold=is_default),
                 fg=BG if is_default else TEXT_DIM,
-                bg=ACCENT if is_default else BG3,
+                bg=ACCENT if is_default else ("#8a6000" if is_game_std else BG3),
                 activebackground=ACCENT2, activeforeground=BG,
                 relief="flat", cursor="hand2",
                 padx=6, pady=4,
@@ -1450,7 +1726,7 @@ class RetroRewindApp(tk.Tk):
                 on = toggle_widget.var.get()
                 for sw in slider_widgets:
                     sw.set_enabled(on)
-                self._notify_combined()
+                self._refresh_combined()
             toggle_widget.var.trace_add("write", _update)
             _update()   # set initial state right away
 
@@ -1484,8 +1760,8 @@ class RetroRewindApp(tk.Tk):
         gpu_cb = tk.Checkbutton(
             hw_row, text="Use GPU (OpenCL)",
             variable=self._use_gpu,
-            bg=BG2, activebackground=BG2, selectcolor=BG3,
-            fg=LED if self._gpu_avail else TEXT_DIM,
+            bg=BG2, activebackground=BG2, selectcolor=BG4,
+            fg=LED if self._gpu_avail else TEXT,
             activeforeground=LED,
             font=_font(9), relief="flat", cursor="hand2" if self._gpu_avail else "",
         )
@@ -1513,8 +1789,8 @@ class RetroRewindApp(tk.Tk):
         self._btn = tk.Button(
             row1, text="▶  CONVERT TO VHS",
             command=self._start_conversion,
-            fg=BG, bg=ACCENT,
-            activebackground=ACCENT2, activeforeground=BG,
+            fg="#fff", bg=ACCENT,
+            activebackground="#ff3355", activeforeground="#fff",
             **btn_cfg_primary,
         )
         self._btn.pack(side="left", padx=(0, 10))
@@ -1522,8 +1798,8 @@ class RetroRewindApp(tk.Tk):
         self._stop_btn = tk.Button(
             row1, text="⏹  STOP",
             command=self._stop_conversion,
-            fg=TEXT_DIM, bg=BG3,
-            activebackground="#330000", activeforeground=ACCENT,
+            fg=TEXT, bg=BG4,
+            activebackground="#440000", activeforeground=ACCENT,
             state="disabled",
             **btn_cfg_sec,
         )
@@ -1536,14 +1812,17 @@ class RetroRewindApp(tk.Tk):
         self._preview_btn = tk.Button(
             row2, text="📼  PREVIEW RESULT",
             command=self._open_preview,
-            fg=TEXT_DIM, bg=BG3,
-            activebackground=BG2, activeforeground=TEXT,
+            fg=TEXT, bg=BG4,
+            activebackground=BG3, activeforeground=ACCENT2,
             state="disabled",
             **btn_cfg_sec,
         )
         self._preview_btn.pack()
 
         tk.Frame(p, bg=BG, height=6).pack()
+
+        # Populate combined preview with initial settings after all controls built
+        self.after(200, self._refresh_combined)
 
     # ── HELPERS ─────────────────────────────────────────────
 
@@ -1554,17 +1833,30 @@ class RetroRewindApp(tk.Tk):
         except Exception:
             pass
 
-    def _set_output_size(self, size):
-        self._out_size.set(size)
-        for sz, btn in self._size_btns.items():
-            is_sel = (sz == size)
+    def _set_vhs_quality(self, key):
+        self._vhs_quality.set(key)
+        for k, btn in self._quality_btns.items():
+            is_sel = (k == key)
             btn.config(
                 fg=BG if is_sel else TEXT_DIM,
                 bg=ACCENT if is_sel else BG3,
                 font=_font(8, bold=is_sel),
             )
+
+    def _set_output_size(self, size):
+        self._out_size.set(size)
+        for sz, btn in self._size_btns.items():
+            is_sel     = (sz == size)
+            is_std     = (sz == 512)
+            lbl        = (str(sz) + " ★") if is_std else str(sz)
+            btn.config(
+                text=lbl,
+                fg=BG if is_sel else TEXT_DIM,
+                bg=ACCENT if is_sel else ("#8a6000" if is_std else BG3),
+                font=_font(8, bold=is_sel),
+            )
         self._draw_size_preview()
-        self._notify_combined()
+        self._refresh_combined()
 
     def _draw_size_preview(self):
         c = self._size_canvas
@@ -1601,6 +1893,76 @@ class RetroRewindApp(tk.Tk):
                   activebackground=ACCENT2, activeforeground=BG,
                   relief="flat", cursor="hand2", padx=10).pack(side="right")
 
+    def _select_genre(self, genre):
+        """Select a genre — highlights the button and updates output path."""
+        self._rr_category.set(genre)
+        for g, btn in self._genre_btns.items():
+            STARTER_GENRES = {"Public", "Scifi", "Police"}
+            is_sel     = (g == genre)
+            is_starter = g in STARTER_GENRES
+            idle_bg = "#0a2a0a" if is_starter else BG3
+            idle_fg = LED if is_starter else TEXT
+            tip = " ★ Starter" if is_starter else ""
+            btn.config(
+                text=g + tip,
+                fg=BG if is_sel else idle_fg,
+                bg=ACCENT if is_sel else idle_bg,
+                font=_font(8, bold=is_sel),
+            )
+        self._update_output_path()
+
+    def _detect_game_folder(self):
+        """
+        Detect the VHS folder: RetroRewind/RetroRewind/Content/Movies/VHS
+        Searches all drives and common Steam library locations.
+        """
+        VHS_SUBPATH = os.path.join("steamapps","common","RetroRewind",
+                                   "RetroRewind","Content","Movies","VHS")
+        candidates = []
+        for drive in ["C:", "D:", "E:", "F:", "G:"]:
+            for steam_root in [
+                os.path.join(drive, os.sep, "SteamLibrary"),
+                os.path.join(drive, os.sep, "Program Files (x86)", "Steam"),
+                os.path.join(drive, os.sep, "Program Files", "Steam"),
+                os.path.join(drive, os.sep, "Steam"),
+            ]:
+                candidates.append(os.path.join(steam_root, VHS_SUBPATH))
+        for path in candidates:
+            if os.path.isdir(path):
+                self._game_folder.set(path)
+                self._status_text.set(f"Found: {path}")
+                self._update_output_path()
+                return
+        self._status_text.set("Not found — Browse to RetroRewind/RetroRewind/Content/Movies/VHS")
+
+    def _browse_game_folder(self):
+        path = filedialog.askdirectory(title="Select Retro Rewind game folder")
+        if path:
+            self._game_folder.set(path)
+
+    def _update_output_path(self, *_):
+        """
+        Build output path:
+          {VHS_folder}/{Genre}/RR_Channel_{Genre}.mp4
+        If no game folder, save beside the input file.
+        """
+        if not self._auto_name.get():
+            return
+        cat = self._rr_category.get().strip() or "Action"
+        filename = f"RR_Channel_{cat}.mp4"
+        game = self._game_folder.get().strip()
+        if game and os.path.isdir(game):
+            # Save into the genre subfolder inside VHS
+            genre_dir = os.path.join(game, cat)
+            os.makedirs(genre_dir, exist_ok=True)
+            self._output_path.set(os.path.join(genre_dir, filename))
+        else:
+            inp = self._input_path.get().strip()
+            if inp:
+                self._output_path.set(str(Path(inp).parent / filename))
+            else:
+                self._output_path.set(filename)
+
     def _browse_input(self):
         path = filedialog.askopenfilename(
             title="Select MP4 video",
@@ -1608,8 +1970,14 @@ class RetroRewindApp(tk.Tk):
         )
         if path:
             self._input_path.set(path)
-            p = Path(path)
-            self._output_path.set(str(p.parent / (p.stem + "_VHS.mp4")))
+            # _update_output_path fires via trace — don't override it here
+            # But call it explicitly in case trace doesn't fire on same-value set
+            self.after(10, self._update_output_path)
+            # Load preview frames in background
+            def _load():
+                self._combined.load_video(path)
+                self.after(0, self._refresh_combined)
+            threading.Thread(target=_load, daemon=True).start()
 
     def _browse_output(self):
         path = filedialog.asksaveasfilename(
@@ -1642,7 +2010,14 @@ class RetroRewindApp(tk.Tk):
             "noise_level"  : self._noise_level.get(),
             "glitch_level" : self._glitch_level.get(),
             "rec_overlay"  : self._fx["rec_overlay"].get(),
+            "interlace"    : self._fx.get("interlace",    tk.BooleanVar(value=True)).get() if "interlace" in self._fx else True,
+            "head_switch"  : self._fx.get("head_switch",  tk.BooleanVar(value=True)).get() if "head_switch" in self._fx else True,
+            "dropout"      : self._fx.get("dropout",      tk.BooleanVar(value=False)).get() if "dropout" in self._fx else False,
+            "edge_ringing" : self._fx.get("edge_ringing", tk.BooleanVar(value=False)).get() if "edge_ringing" in self._fx else False,
+            "chroma_noise" : self._fx.get("chroma_noise", tk.BooleanVar(value=True)).get() if "chroma_noise" in self._fx else True,
+            "wobble"       : self._fx.get("wobble",       tk.BooleanVar(value=False)).get() if "wobble" in self._fx else False,
             "out_size"     : self._out_size.get(),
+            "vhs_quality"  : self._vhs_quality.get(),
         }
 
     # ── CONVERSION ──────────────────────────────────────────
@@ -1758,8 +2133,7 @@ class VideoPlayerWindow(tk.Toplevel):
         self._canvas = tk.Canvas(cf, width=D, height=D,
                                  bg="#000", highlightthickness=0)
         self._canvas.pack()
-        self._canvas.create_text(D-6, 6, anchor="ne", text="● REC",
-                                 fill=ACCENT, font=_font(7, bold=True), tags="hud")
+        # REC indicator — drawn dynamically in _render, not hardcoded
 
         sf = tk.Frame(self, bg=BG)
         sf.pack(fill="x", padx=12, pady=(6, 2))
@@ -1806,7 +2180,7 @@ class VideoPlayerWindow(tk.Toplevel):
             ppm = b"P6\n" + f"{D} {D}\n255\n".encode() + rgb.tobytes()
             self._photo = tk.PhotoImage(data=ppm)
         self._canvas.create_image(0, 0, anchor="nw", image=self._photo)
-        self._canvas.tag_raise("hud")
+        # (no hud overlay in player)
         # Update the custom scrub bar
         if hasattr(self, "_scrub_canvas"):
             self._draw_scrub()
@@ -1953,11 +2327,17 @@ def main():
                       f"pip install opencv-python numpy\n\n{e}")
         sys.exit(1)
 
-    if shutil.which("ffmpeg") is None:
+    if _find_ffmpeg() is None:
         import tkinter as _tk, tkinter.messagebox as _mb
         _tk.Tk().withdraw()
-        _mb.showerror("FFmpeg not found",
-                      "Install FFmpeg from https://ffmpeg.org/download.html")
+        _mb.showerror(
+            "FFmpeg not found",
+            "FFmpeg was not found.\n\n"
+            "If you downloaded from GitHub, make sure you got the full\n"
+            "release zip — FFmpeg is included inside it.\n\n"
+            "Or install FFmpeg from https://ffmpeg.org/download.html\n"
+            "and add it to your PATH."
+        )
         sys.exit(1)
 
     RetroRewindApp().mainloop()
